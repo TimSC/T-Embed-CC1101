@@ -54,6 +54,7 @@ namespace page_ble     { void init(); void update(); void render(); void deinit(
 namespace page_tft     { void init(); void update(); void render(); void deinit(); }
 namespace page_ws2812  { void init(); void update(); void render(); void deinit(); }
 namespace page_setting { void init(); void update(); void render(); void deinit(); }
+namespace page_sht41   { void init(); void update(); void render(); void deinit(); }
 
 enum class PageId : uint8_t {
     MainMenu = 0,
@@ -69,6 +70,7 @@ enum class PageId : uint8_t {
     TFT,
     WS2812,
     Setting,
+    Sht41,
     kCount,
 };
 
@@ -329,6 +331,7 @@ static const PageDescriptor kPages[] = {
     { "TFT Display",   page_tft::init,     page_tft::update,     page_tft::render,     page_tft::deinit     },
     { "WS2812 LEDs",   page_ws2812::init,  page_ws2812::update,  page_ws2812::render,  page_ws2812::deinit  },
     { "Settings",      page_setting::init, page_setting::update, page_setting::render, page_setting::deinit },
+    { "SHT41 Sensor",  page_sht41::init,   page_sht41::update,   page_sht41::render,   page_sht41::deinit   },
 };
 
 constexpr uint8_t  kEncA = ENCODER_INA;
@@ -922,6 +925,7 @@ void enterSystemSleepNow()
 #include "page_nfc.h"
 #include "page_nrf24.h"
 #include "page_sd.h"
+#include "page_sht41.h"
 #include "page_ws2812.h"
 #include "page_setting.h"
 #include "page_wifi.h"
