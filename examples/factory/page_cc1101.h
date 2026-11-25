@@ -12,6 +12,7 @@ enum class RadioMode : uint8_t {
     Receive = 0,
     BurstTransmit,
     SniffOok,
+    SniffFsk,
 };
 
 enum class LedEffect : uint8_t {
@@ -23,6 +24,7 @@ enum class LedEffect : uint8_t {
 
 struct PulseEvent {
     uint32_t durationUs;
+    bool wasHigh;
 };
 
 constexpr FreqChoice kFreqChoices[] = {
@@ -60,6 +62,7 @@ constexpr uint8_t kCcRegMdmCfg2 = 0x12;
 constexpr uint8_t kCcCmdSidle = 0x36;
 constexpr uint8_t kCcCmdSfrx = 0x3A;
 constexpr uint8_t kCcCmdSrx = 0x34;
+constexpr uint8_t kCcGdoCarrierSense = 0x0E;
 constexpr uint8_t kCcGdoSerialDataAsync = 0x0D;
 constexpr uint8_t kCcPktCtrl0AsyncSerial = 0x30;
 constexpr float kSniffRxBwKHz = 270.0f;
@@ -70,6 +73,10 @@ constexpr uint32_t kLedFlashMs = 200;
 
 constexpr size_t kPulseRingSize = 256;
 constexpr uint32_t kBurstSilenceUs = 5000;
+constexpr uint32_t kFskBurstGapUs = 16000;
+constexpr uint8_t k868MHzRfPath = 2;
+constexpr float kFskFrequencyMHz = 868.286f;
+constexpr size_t kFskTimingCapacity = 256;
 constexpr uint32_t kMinValidPulseUs = 80;
 constexpr uint32_t kMaxValidPulseUs = 20000;
 constexpr uint32_t kSniffScreenIntervalMs = 250;
@@ -85,6 +92,10 @@ volatile uint16_t pulseHead = 0;
 volatile uint16_t pulseTail = 0;
 volatile uint32_t lastEdgeUs = 0;
 volatile uint32_t isrEdgeCount = 0;
+volatile uint32_t droppedEdges = 0;
+volatile bool captureFsk = false;
+int32_t fskTimings[kFskTimingCapacity];
+bool fskBurstTruncated = false;
 
 RadioMode currentMode = RadioMode::Receive;
 uint8_t currentFreqIndex = 1;
@@ -123,14 +134,19 @@ uint32_t lastEdgeAtMs = 0;
 uint32_t lastSniffDrawMs = 0;
 bool inBurst = false;
 
+bool isSniffMode()
+{
+    return currentMode == RadioMode::SniffOok || currentMode == RadioMode::SniffFsk;
+}
+
 inline float currentFrequencyMHz()
 {
-    return kFreqChoices[currentFreqIndex].mhz;
+    return currentMode == RadioMode::SniffFsk ? kFskFrequencyMHz : kFreqChoices[currentFreqIndex].mhz;
 }
 
 inline const char* currentFrequencyLabel()
 {
-    return kFreqChoices[currentFreqIndex].label;
+    return currentMode == RadioMode::SniffFsk ? "868.286 MHz" : kFreqChoices[currentFreqIndex].label;
 }
 
 const char* modeLabel(const RadioMode mode)
@@ -142,6 +158,8 @@ const char* modeLabel(const RadioMode mode)
             return "TX-BURST";
         case RadioMode::SniffOok:
             return "SNIFF-OOK";
+        case RadioMode::SniffFsk:
+            return "SNIFF-FSK";
         default:
             return "?";
     }
@@ -156,13 +174,19 @@ void IRAM_ATTR onPacketReceived()
 void IRAM_ATTR onSniffEdge()
 {
     const uint32_t now = micros();
+    if (captureFsk && !digitalRead(BOARD_LORA_IO0)) {
+        return;
+    }
     const uint32_t dur = now - lastEdgeUs;
     lastEdgeUs = now;
 
     const uint16_t next = (pulseHead + 1U) % kPulseRingSize;
     if (next != pulseTail) {
         pulseRing[pulseHead].durationUs = dur;
+        pulseRing[pulseHead].wasHigh = captureFsk && !digitalRead(BOARD_LORA_IO2);
         pulseHead = next;
+    } else {
+        droppedEdges++;
     }
     isrEdgeCount++;
 }
@@ -281,6 +305,10 @@ void drawModeRow()
             color = TFT_MAGENTA;
             label = "SNIFF OOK";
             break;
+        case RadioMode::SniffFsk:
+            color = TFT_RED;
+            label = "REC FSK";
+            break;
         default:
             break;
     }
@@ -354,7 +382,7 @@ void drawSniffRows()
     tft.fillRect(0, kRowInfo1, tft.width(), tft.height() - kFooterHeight - kRowInfo1, TFT_BLACK);
 
     tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-    tft.drawString("OOK sniff:", kMarginLeft, kRowInfo1, 1);
+    tft.drawString(currentMode == RadioMode::SniffFsk ? "FSK capture (USB serial):" : "OOK sniff:", kMarginLeft, kRowInfo1, 1);
 
     char line[64];
     snprintf(line, sizeof(line), "Edges: %lu   Bursts: %lu",
@@ -375,7 +403,7 @@ void drawSniffRows()
         tft.drawString(line, kMarginLeft, kRowInfo4, 1);
     } else {
         tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
-        tft.drawString("Press the remote near antenna...", kMarginLeft, kRowInfo3, 1);
+        tft.drawString(currentMode == RadioMode::SniffFsk ? "Waiting for thermostat..." : "Press the remote near antenna...", kMarginLeft, kRowInfo3, 1);
     }
 }
 
@@ -392,7 +420,7 @@ void redrawAll()
         drawModeRow();
         drawDivider();
 
-        if (currentMode == RadioMode::SniffOok) {
+        if (isSniffMode()) {
             drawSniffRows();
         } else if (currentMode == RadioMode::Receive) {
             drawReceiveRows();
@@ -404,6 +432,8 @@ void redrawAll()
             drawFooter("Radio init failed");
         } else if (backFocused) {
             drawFooter("BOOT=back  USER=freq");
+        } else if (currentMode == RadioMode::SniffFsk) {
+            drawFooter("Press knob to stop");
         } else {
             drawFooter("USER=freq  BOOT=mode");
         }
@@ -411,7 +441,7 @@ void redrawAll()
         return;
     }
 
-    if (currentMode == RadioMode::SniffOok) {
+    if (isSniffMode()) {
         if (needSniffStatsRedraw) {
             needSniffStatsRedraw = false;
             drawSniffRows();
@@ -434,15 +464,16 @@ void printHelp()
     Serial.println(F("CC1101 send/receive test commands:"));
     Serial.println(F("  help              - show this help"));
     Serial.println(F("  status            - show current settings"));
-    Serial.println(F("  rx                - enter receive mode"));
+    Serial.println(F("  rx                - enter packet RX / stop capture"));
     Serial.println(F("  tx                - send a test packet every second"));
     Serial.println(F("  sniff             - raw OOK pulse sniffer"));
+    Serial.println(F("  sniff-fsk         - Salus FSK timings to USB serial"));
     Serial.println(F("  send <text>       - send one packet immediately"));
     Serial.println(F("  freq 315|433|868  - switch frequency"));
     Serial.println(F("  prefix <text>     - change periodic TX message prefix"));
     Serial.println(F("Hardware controls:"));
     Serial.println(F("  USER key          - cycle frequency"));
-    Serial.println(F("  BOOT key          - cycle RX -> TX -> SNIFF"));
+    Serial.println(F("  BOOT key          - cycle RX -> TX -> OOK -> FSK"));
     Serial.println(F("  Encoder rotate    - focus BACK"));
     Serial.println();
 }
@@ -453,16 +484,20 @@ void printStatus()
     Serial.print(F("[CC1101] Mode:        "));
     Serial.println(modeLabel(currentMode));
     Serial.print(F("[CC1101] Frequency:   "));
-    Serial.print(currentFrequencyMHz(), 2);
+    Serial.print(currentFrequencyMHz(), 3);
     Serial.println(F(" MHz"));
     Serial.print(F("[CC1101] Modulation:  "));
-    Serial.println(kUseOok ? F("OOK") : F("2-FSK"));
+    Serial.println(currentMode == RadioMode::SniffFsk || !kUseOok ? F("2-FSK") : F("OOK"));
     Serial.print(F("[CC1101] Bit rate:    "));
     Serial.print(kBitRateKbps, 1);
     Serial.println(F(" kbps"));
     Serial.print(F("[CC1101] RX BW:       "));
     Serial.print(kRxBandwidthKHz, 1);
     Serial.println(F(" kHz"));
+    if (currentMode == RadioMode::SniffFsk) {
+        Serial.println(F("[CC1101] Output:      FSK_RAW over USB serial"));
+        return;
+    }
     Serial.print(F("[CC1101] Sync word:   0x"));
     Serial.print(kSyncWordHigh, HEX);
     Serial.print(F(" 0x"));
@@ -573,32 +608,43 @@ bool initRadio()
     delay(20);
 
     Serial.print(F("[CC1101] Initializing at "));
-    Serial.print(currentFrequencyMHz(), 2);
+    Serial.print(currentFrequencyMHz(), 3);
     Serial.println(F(" MHz ..."));
     return applyRadioSettings();
 }
 
-void leaveSniffMode()
+void drainFskBuffer();
+void finishFskBurst();
+
+void leaveSniffMode(const bool wasFsk)
 {
     detachInterrupt(digitalPinToInterrupt(BOARD_LORA_IO0));
     detachInterrupt(digitalPinToInterrupt(BOARD_LORA_IO2));
 
+    if (wasFsk) {
+        drainFskBuffer();
+        finishFskBurst();
+        Serial.println(F("[CC1101] FSK capture stopped."));
+    }
+
     board_spi_deselect_all();
     (void)radio.SPIsendCommand(kCcCmdSidle);
     (void)radio.SPIsendCommand(kCcCmdSfrx);
+    (void)setRfPathForFrequencyIndex(currentFreqIndex);
     (void)applyRadioSettings();
 }
 
 bool enterReceiveMode()
 {
-    const bool wasSniff = (currentMode == RadioMode::SniffOok);
+    const bool wasSniff = isSniffMode();
+    const bool wasFsk = currentMode == RadioMode::SniffFsk;
     currentMode = RadioMode::Receive;
     packetReceived = false;
     needFullRedraw = true;
     screenDirty = true;
 
     if (wasSniff) {
-        leaveSniffMode();
+        leaveSniffMode(wasFsk);
     }
 
     detachInterrupt(digitalPinToInterrupt(BOARD_LORA_IO0));
@@ -624,14 +670,15 @@ bool enterReceiveMode()
 
 void enterBurstTransmitMode()
 {
-    const bool wasSniff = (currentMode == RadioMode::SniffOok);
+    const bool wasSniff = isSniffMode();
+    const bool wasFsk = currentMode == RadioMode::SniffFsk;
     currentMode = RadioMode::BurstTransmit;
     lastBurstAtMs = 0;
     needFullRedraw = true;
     screenDirty = true;
 
     if (wasSniff) {
-        leaveSniffMode();
+        leaveSniffMode(wasFsk);
     }
 
     detachInterrupt(digitalPinToInterrupt(BOARD_LORA_IO0));
@@ -646,14 +693,21 @@ void enterBurstTransmitMode()
     Serial.println(F("[CC1101] Mode switched to TX burst."));
 }
 
-bool enterSniffMode()
+bool enterSniffMode(const RadioMode mode = RadioMode::SniffOok)
 {
-    currentMode = RadioMode::SniffOok;
+    detachInterrupt(digitalPinToInterrupt(BOARD_LORA_IO0));
+    detachInterrupt(digitalPinToInterrupt(BOARD_LORA_IO2));
+
+    currentMode = mode;
+    const bool fsk = mode == RadioMode::SniffFsk;
+    captureFsk = fsk;
     needFullRedraw = true;
     screenDirty = true;
 
     pulseHead = 0;
     pulseTail = 0;
+    droppedEdges = 0;
+    fskBurstTruncated = false;
     lastEdgeUs = micros();
     isrEdgeCount = 0;
     totalEdges = 0;
@@ -670,9 +724,6 @@ bool enterSniffMode()
     lastSniffDrawMs = 0;
     inBurst = false;
 
-    detachInterrupt(digitalPinToInterrupt(BOARD_LORA_IO0));
-    detachInterrupt(digitalPinToInterrupt(BOARD_LORA_IO2));
-
     board_spi_deselect_all();
     radio.clearPacketReceivedAction();
     radio.clearPacketSentAction();
@@ -680,27 +731,28 @@ bool enterSniffMode()
     (void)radio.finishTransmit();
     (void)radio.standby();
 
-    int state = radio.setOOK(true);
+    (void)setRfPathForFrequencyIndex(fsk ? k868MHzRfPath : currentFreqIndex);
+    int state = radio.setFrequency(currentFrequencyMHz());
+    if (state == RADIOLIB_ERR_NONE) {
+        state = radio.setOOK(!fsk);
+    }
+    if (state == RADIOLIB_ERR_NONE) {
+        state = radio.setRxBandwidth(fsk ? kRxBandwidthKHz : kSniffRxBwKHz);
+    }
+    if (state == RADIOLIB_ERR_NONE) {
+        state = radio.setBitRate(fsk ? kBitRateKbps : kSniffBitRateKbps);
+    }
+    if (state == RADIOLIB_ERR_NONE && fsk) {
+        state = radio.setFrequencyDeviation(kFrequencyDeviationKHz);
+    }
     if (state != RADIOLIB_ERR_NONE) {
-        Serial.print(F("[CC1101] sniff: setOOK failed, code "));
-        Serial.println(state);
+        Serial.printf("[CC1101] Sniff setup failed: %d\n", state);
+        (void)enterReceiveMode();
         return false;
     }
 
-    state = radio.setRxBandwidth(kSniffRxBwKHz);
-    if (state != RADIOLIB_ERR_NONE) {
-        Serial.print(F("[CC1101] sniff: setRxBandwidth failed, code "));
-        Serial.println(state);
-    }
-
-    state = radio.setBitRate(kSniffBitRateKbps);
-    if (state != RADIOLIB_ERR_NONE) {
-        Serial.print(F("[CC1101] sniff: setBitRate failed, code "));
-        Serial.println(state);
-    }
-
     radio.SPIsetRegValue(kCcRegMdmCfg2, 0x00, 2, 0);
-    radio.SPIsetRegValue(kCcRegIocfg0, kCcGdoSerialDataAsync);
+    radio.SPIsetRegValue(kCcRegIocfg0, fsk ? kCcGdoCarrierSense : kCcGdoSerialDataAsync);
     radio.SPIsetRegValue(kCcRegIocfg2, kCcGdoSerialDataAsync);
     radio.SPIsetRegValue(kCcRegPktCtrl0, kCcPktCtrl0AsyncSerial | 0x02);
 
@@ -708,11 +760,13 @@ bool enterSniffMode()
     (void)radio.SPIsendCommand(kCcCmdSfrx);
     (void)radio.SPIsendCommand(kCcCmdSrx);
 
+    pinMode(BOARD_LORA_IO0, INPUT);
     pinMode(BOARD_LORA_IO2, INPUT);
+    lastEdgeUs = micros() - (fsk ? kFskBurstGapUs : 0U);
     attachInterrupt(digitalPinToInterrupt(BOARD_LORA_IO2), onSniffEdge, CHANGE);
 
-    Serial.print(F("[CC1101] Mode switched to OOK sniff @ "));
-    Serial.print(currentFrequencyMHz(), 2);
+    Serial.print(fsk ? F("[CC1101] FSK capture started @ ") : F("[CC1101] Mode switched to OOK sniff @ "));
+    Serial.print(currentFrequencyMHz(), 3);
     Serial.println(F(" MHz."));
     return true;
 }
@@ -770,8 +824,8 @@ bool reinitializeRadioForCurrentMode()
     if (currentMode == RadioMode::Receive) {
         return enterReceiveMode();
     }
-    if (currentMode == RadioMode::SniffOok) {
-        return enterSniffMode();
+    if (isSniffMode()) {
+        return enterSniffMode(currentMode);
     }
 
     enterBurstTransmitMode();
@@ -822,9 +876,89 @@ void handleReceivedPacket()
     }
 }
 
+void finishFskBurst()
+{
+    if (currentBurstPulses >= 4U) {
+        burstCount++;
+        lastBurstPulses = currentBurstPulses;
+        lastBurstShortUs = currentBurstMinUs;
+        lastBurstLongUs = currentBurstMaxUs;
+        Serial.printf("FSK_RAW burst=%lu truncated=%u timings_us=",
+                      static_cast<unsigned long>(burstCount),
+                      static_cast<unsigned>(fskBurstTruncated));
+        for (uint16_t i = 0; i < currentBurstPulses; ++i) {
+            Serial.printf("%s%ld", i == 0 ? "" : ",", static_cast<long>(fskTimings[i]));
+        }
+        Serial.println();
+        triggerLedEffect(LedEffect::SniffFlash);
+        needSniffStatsRedraw = true;
+        screenDirty = true;
+    }
+    currentBurstPulses = 0;
+    fskBurstTruncated = false;
+}
+
+void drainFskBuffer()
+{
+    for (size_t i = 0; i < kPulseRingSize; ++i) {
+        noInterrupts();
+        const bool empty = pulseTail == pulseHead;
+        const uint32_t lost = droppedEdges;
+        const uint32_t elapsedUs = micros() - lastEdgeUs;
+        if (lost != 0) {
+            pulseTail = pulseHead;
+            droppedEdges = 0;
+        }
+        if (empty || lost != 0) {
+            interrupts();
+            if (lost != 0) {
+                fskBurstTruncated = true;
+                Serial.printf("[CC1101] FSK buffer overflow: %lu dropped edges\n",
+                              static_cast<unsigned long>(lost));
+            }
+            if (lost != 0 || elapsedUs >= kFskBurstGapUs) {
+                finishFskBurst();
+            }
+            break;
+        }
+
+        const uint32_t duration = pulseRing[pulseTail].durationUs;
+        const bool wasHigh = pulseRing[pulseTail].wasHigh;
+        pulseTail = (pulseTail + 1U) % kPulseRingSize;
+        interrupts();
+
+        if (duration >= kFskBurstGapUs) {
+            finishFskBurst();
+        } else if (currentBurstPulses < kFskTimingCapacity) {
+            const int32_t timing = static_cast<int32_t>(duration);
+            fskTimings[currentBurstPulses++] = wasHigh ? timing : -timing;
+            if (currentBurstPulses == 1 || duration < currentBurstMinUs) {
+                currentBurstMinUs = duration;
+            }
+            if (currentBurstPulses == 1 || duration > currentBurstMaxUs) {
+                currentBurstMaxUs = duration;
+            }
+        } else {
+            fskBurstTruncated = true;
+        }
+    }
+
+    const uint32_t now = millis();
+    if (now - lastSniffDrawMs >= kSniffScreenIntervalMs) {
+        totalEdges = isrEdgeCount;
+        lastSniffDrawMs = now;
+        needSniffStatsRedraw = true;
+        screenDirty = true;
+    }
+}
+
 void drainSniffBuffer()
 {
-    if (currentMode != RadioMode::SniffOok) {
+    if (currentMode == RadioMode::SniffFsk) {
+        drainFskBuffer();
+        return;
+    }
+    if (!isSniffMode()) {
         return;
     }
 
@@ -974,11 +1108,25 @@ void handleCommand(String line)
     }
 
     if (line.equalsIgnoreCase("sniff")) {
+        if (currentMode == RadioMode::SniffFsk) {
+            leaveSniffMode(true);
+        }
         (void)enterSniffMode();
         return;
     }
 
+    if (line.equalsIgnoreCase("sniff-fsk")) {
+        if (currentMode != RadioMode::SniffFsk) {
+            (void)enterSniffMode(RadioMode::SniffFsk);
+        }
+        return;
+    }
+
     if (line.startsWith("send ")) {
+        if (currentMode == RadioMode::SniffFsk) {
+            Serial.println(F("[CC1101] Stop FSK capture before sending."));
+            return;
+        }
         String payload = line.substring(5);
         payload.trim();
         if (payload.isEmpty()) {
@@ -1008,6 +1156,10 @@ void handleCommand(String line)
     }
 
     if (line.startsWith("freq ")) {
+        if (currentMode == RadioMode::SniffFsk) {
+            Serial.println(F("[CC1101] FSK capture is fixed at 868.286 MHz."));
+            return;
+        }
         uint8_t newIndex = 0;
         if (!parseFrequencyToIndex(line.substring(5), newIndex)) {
             Serial.println(F("[CC1101] Unsupported frequency. Use 315, 433 or 868."));
@@ -1017,7 +1169,7 @@ void handleCommand(String line)
         currentFreqIndex = newIndex;
         if (reinitializeRadioForCurrentMode()) {
             Serial.print(F("[CC1101] Frequency switched to "));
-            Serial.print(currentFrequencyMHz(), 2);
+            Serial.print(currentFrequencyMHz(), 3);
             Serial.println(F(" MHz."));
         }
         return;
@@ -1073,6 +1225,9 @@ void toggleMode()
             (void)enterSniffMode();
             break;
         case RadioMode::SniffOok:
+            (void)enterSniffMode(RadioMode::SniffFsk);
+            break;
+        case RadioMode::SniffFsk:
         default:
             (void)enterReceiveMode();
             break;
@@ -1142,7 +1297,7 @@ void update()
 
     pollSerialCommands();
 
-    if (takeUserButton() && !backFocused) {
+    if (takeUserButton() && !backFocused && currentMode != RadioMode::SniffFsk) {
         cycleFrequency();
     }
 
@@ -1180,6 +1335,10 @@ void render()
 
 void deinit()
 {
+    if (currentMode == RadioMode::SniffFsk) {
+        currentMode = RadioMode::Receive;
+        leaveSniffMode(true);
+    }
     detachInterrupt(digitalPinToInterrupt(BOARD_LORA_IO0));
     detachInterrupt(digitalPinToInterrupt(BOARD_LORA_IO2));
     radio.clearPacketReceivedAction();
